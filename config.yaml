@@ -1,0 +1,88 @@
+llm:
+  provider: openai_compatible
+  model: openai/gpt-oss-20b
+  base_url: https://api.groq.com/openai/v1
+  temperature: 0.2
+  max_retries: 3
+  timeout: 60
+
+analysis:
+  batch_size: 5
+  context_enabled: true
+  minimum_promo_relevance: 6
+  context_window_scenes: 1
+  request_interval_seconds: 12
+
+candidate_generation:
+  min_duration: 20
+  max_duration: 60
+  sliding_step: 5
+  durations: [20, 30, 40, 50, 60]
+  methods:
+    - event_anchored
+    - sliding_window
+
+evaluation:
+  minimum_hook_score: 6
+  minimum_cliffhanger_score: 6
+  minimum_context_score: 5
+  max_candidates: 25
+
+ranking:
+  weights:
+    hook_strength: 0.25
+    cliffhanger_strength: 0.25
+    standalone_understandability: 0.20
+    emotional_intensity: 0.15
+    narrative_coherence: 0.10
+    promo_engagement_potential: 0.05
+  category_thresholds:
+    excellent: 85
+    strong: 70
+    moderate: 55
+  minimum_selection_score: 50
+  maximum_selected_promos: 20
+  maximum_promos_per_episode: 3
+  maximum_scene_overlap: 0.6
+  diversity_penalty: 10
+  similarity_threshold: 0.5
+  max_missing_score_llm_calls: 0
+  request_interval_seconds: 12
+
+quality:
+  high_rank_threshold: 5
+  low_quality_threshold: 5
+  narrative_warning_threshold: 6
+  maximum_narrative_evaluations: 20
+  max_narrative_attempts: 1
+  concurrency: 1
+  request_interval_seconds: 12
+  cache_path: outputs/quality_evaluation_and_validation/quality_evaluation_cache.json
+
+multi_segment:
+  enabled: true
+  same_episode_enabled: true
+  cross_episode_enabled: true
+  min_segments: 2
+  max_segments: 4
+  minimum_duration: 20
+  maximum_duration: 60
+  minimum_segment_duration: 6
+  maximum_segment_duration: 24
+  max_moments_per_episode: 12
+  max_candidates_per_episode: 10
+  max_combinations: 100
+  max_llm_calls: 1
+  request_interval_seconds: 12
+  minimum_quality_score: 6
+  cache_path: outputs/multi_segment_promo_generation/evaluation_cache.json
+  checkpoint_path: outputs/multi_segment_promo_generation/checkpoint.json
+
+system_evaluation:
+  human_review_sample_size: 30
+  human_rating_scale: 5
+  ranking_cutoffs: [5, 10, 20]
+  review_dataset_path: outputs/evaluation/human_review_dataset.csv
+  human_reviews_path: outputs/evaluation/human_reviews.json
+  human_reviews_csv_path: outputs/evaluation/human_reviews.csv
+  source_text_limit: 1800

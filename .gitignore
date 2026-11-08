@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+
+# Environment
+.env
+
+# Generated outputs
+scene_analysis.json
+promo_candidates.json
+outputs/
+Solution.pdf
