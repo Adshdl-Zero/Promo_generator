@@ -50,6 +50,7 @@ class EvaluationSettings:
     minimum_cliffhanger_score: int = 6
     minimum_context_score: int = 5
     max_candidates: int = 25
+    request_interval_seconds: float = 16.0
 
 
 @dataclass
@@ -182,6 +183,7 @@ class Settings:
                 minimum_cliffhanger_score=int(evaluation_cfg.get("minimum_cliffhanger_score", 6)),
                 minimum_context_score=int(evaluation_cfg.get("minimum_context_score", 5)),
                 max_candidates=int(evaluation_cfg.get("max_candidates", 25)),
+                request_interval_seconds=max(0.0, float(evaluation_cfg.get("request_interval_seconds", 16.0))),
             ),
             ranking=RankingSettings(
                 weights={**RankingSettings().weights, **ranking_cfg.get("weights", {})},

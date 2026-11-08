@@ -11,9 +11,10 @@ from tests.cmd import app
 
 
 class UploadedFile:
-    def __init__(self, name: str, content: bytes) -> None:
+    def __init__(self, name: str, content: bytes, mime_type: str = "") -> None:
         self.name = name
         self._content = content
+        self.type = mime_type
 
     def getvalue(self) -> bytes:
         return self._content
@@ -43,6 +44,24 @@ def test_upload_rejects_unsupported_and_empty_files_before_creating_run_folder(t
     assert not root.exists()
 
 
+def test_upload_rejects_incompatible_mime_and_corrupted_supported_formats(tmp_path):
+    root = tmp_path / "uploads"
+    with pytest.raises(ValueError, match="MIME type"):
+        app._store_uploaded_files(
+            [UploadedFile("episode.txt", b"screenplay text", "application/pdf")], upload_root=root
+        )
+    with pytest.raises(ValueError, match="invalid or corrupted"):
+        app._store_uploaded_files(
+            [UploadedFile("episode.pdf", b"not a PDF", "application/pdf")], upload_root=root
+        )
+    with pytest.raises(ValueError, match="invalid or corrupted"):
+        app._store_uploaded_files(
+            [UploadedFile("episode.docx", b"not a DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")],
+            upload_root=root,
+        )
+    assert not root.exists()
+
+
 def test_uploaded_pipeline_isolated_commands_run_modules_in_dependency_order(tmp_path):
     run_id = "upload-123"
     source_dir = tmp_path / "data" / "uploads" / run_id
@@ -57,6 +76,15 @@ def test_uploaded_pipeline_isolated_commands_run_modules_in_dependency_order(tmp
     assert all(str(output_root) in " ".join(command) for _, command in commands)
     assert str(output_root / "multi_segment_promo_generation" / "evaluation_cache.json") in commands[3][1]
     assert str(output_root / "promo_ranking_and_selection" / "ranked_promos.json") in commands[4][1]
+
+
+def test_results_exports_resolve_inside_the_selected_run(tmp_path):
+    run_root = tmp_path / "outputs" / "runs" / "run-123"
+    files = app._run_files(run_root)
+
+    assert files["ranked_json"] == run_root / "promo_ranking_and_selection" / "ranked_promos.json"
+    assert files["quality_json"] == run_root / "quality_evaluation_and_validation" / "quality_report.json"
+    assert files["human_metrics"] == run_root / "evaluation" / "evaluation_metrics.json"
 
 
 def test_uploaded_pipeline_stops_after_first_failed_stage(tmp_path):
@@ -79,6 +107,31 @@ def test_uploaded_pipeline_stops_after_first_failed_stage(tmp_path):
     assert len(calls) == 1
     assert "ingestion failed" in output
     assert updates[-1][1] == "error"
+
+
+def test_uploaded_pipeline_can_resume_at_failed_module_without_rerunning_prior_stages(tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str]) -> tuple[int, str]:
+        calls.append(command)
+        return 0, "ok"
+
+    code, _, _ = app._execute_uploaded_pipeline(
+        tmp_path / "uploads" / "resume-run",
+        "resume-run",
+        "mock",
+        command_runner=fake_runner,
+        start_at_module=3,
+    )
+
+    assert code == 0
+    assert [Path(command[1]).name for command in calls] == [
+        "run_promo_generation.py",
+        "run_module6_multi_segment.py",
+        "run_module4_rank.py",
+        "run_module5_quality.py",
+        "run_module8_evaluation.py",
+    ]
 
 
 def test_existing_data_pipeline_runs_modules_3_6_4_5_in_order(monkeypatch):

@@ -7,6 +7,8 @@ import os
 import re
 import subprocess
 import sys
+import zipfile
+from io import BytesIO
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 UPLOAD_ROOT = ROOT / "data" / "uploads"
 RUNS_ROOT = ROOT / "outputs" / "runs"
 ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".pdf", ".docx"}
+PIPELINE_MODULE_ORDER = (1, 2, 3, 6, 4, 5, 8)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -53,6 +56,67 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _validate_upload(uploaded_file: Any) -> tuple[str, bytes]:
+    """Validate the uploaded screenplay's extension, MIME type, and file structure."""
+    original_name = str(getattr(uploaded_file, "name", "")).replace("\\", "/")
+    filename = re.sub(r'[<>:"|?*\x00-\x1f]', "_", original_name.rsplit("/", 1)[-1]).strip(" .")
+    suffix = Path(filename).suffix.lower()
+    if not filename or suffix not in ALLOWED_UPLOAD_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS))
+        raise ValueError(f"Unsupported upload {filename or '(unnamed)'!r}; accepted types: {allowed}.")
+    content = uploaded_file.getvalue()
+    if not content or not content.strip():
+        raise ValueError(f"Uploaded file {filename!r} is empty.")
+
+    provided_mime = str(getattr(uploaded_file, "type", "") or "").split(";", 1)[0].lower()
+    accepted_mimes = {
+        ".txt": {"text/plain", "application/octet-stream"},
+        ".pdf": {"application/pdf", "application/octet-stream"},
+        ".docx": {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/zip",
+            "application/octet-stream",
+        },
+    }
+    if provided_mime and provided_mime not in accepted_mimes[suffix]:
+        raise ValueError(f"Uploaded file {filename!r} has an incompatible MIME type ({provided_mime}).")
+
+    if suffix == ".txt":
+        if b"\x00" in content:
+            raise ValueError(f"Uploaded TXT file {filename!r} is not readable text.")
+        decoded = False
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                content.decode(encoding)
+                decoded = True
+                break
+            except UnicodeDecodeError:
+                continue
+        if not decoded:
+            raise ValueError(f"Uploaded TXT file {filename!r} is not readable text.")
+    elif suffix == ".pdf":
+        if not content.lstrip().startswith(b"%PDF-"):
+            raise ValueError(f"Uploaded PDF file {filename!r} is invalid or corrupted.")
+        try:
+            import fitz
+            with fitz.open(stream=content, filetype="pdf") as document:
+                if document.is_closed or document.page_count < 1:
+                    raise ValueError("PDF contains no readable pages.")
+                document[0].get_text("text")
+        except Exception as exc:
+            raise ValueError(f"Uploaded PDF file {filename!r} is invalid or corrupted: {exc}") from exc
+    else:
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as document:
+                if "word/document.xml" not in document.namelist():
+                    raise ValueError("DOCX document body is missing.")
+                if document.testzip() is not None:
+                    raise ValueError("DOCX archive failed its integrity check.")
+        except Exception as exc:
+            raise ValueError(f"Uploaded DOCX file {filename!r} is invalid or corrupted: {exc}") from exc
+    return filename, content
 
 
 @st.cache_data(show_spinner=False) if st is not None else (lambda func: func)
@@ -210,15 +274,7 @@ def _store_uploaded_files(
 
     prepared: list[tuple[str, bytes]] = []
     for index, uploaded_file in enumerate(uploaded_files, start=1):
-        original_name = str(getattr(uploaded_file, "name", "")).replace("\\", "/")
-        filename = re.sub(r'[<>:"|?*\x00-\x1f]', "_", original_name.rsplit("/", 1)[-1]).strip(" .")
-        suffix = Path(filename).suffix.lower()
-        if not filename or suffix not in ALLOWED_UPLOAD_EXTENSIONS:
-            allowed = ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS))
-            raise ValueError(f"Unsupported upload {filename or '(unnamed)'!r}; accepted types: {allowed}.")
-        content = uploaded_file.getvalue()
-        if not content:
-            raise ValueError(f"Uploaded file {filename!r} is empty.")
+        filename, content = _validate_upload(uploaded_file)
         prepared.append((f"{index:03d}_{filename}", content))
 
     run_id = uuid4().hex[:12]
@@ -234,7 +290,7 @@ def _build_uploaded_pipeline_commands(
     run_id: str,
     provider: str | None,
 ) -> tuple[Path, list[tuple[str, list[str]]]]:
-    """Create isolated commands for Modules 1–6 and 8 using only one upload run."""
+    """Create isolated commands for one run in dependency order: 1, 2, 3, 6, 4, 5, 8."""
     if not run_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in run_id):
         raise ValueError("Run ID contains unsupported characters.")
 
@@ -322,11 +378,18 @@ def _execute_uploaded_pipeline(
     *,
     command_runner: Any = None,
     on_step: Any = None,
+    start_at_module: int = 1,
 ) -> tuple[int, str, Path]:
     output_root, commands = _build_uploaded_pipeline_commands(input_directory, run_id, provider)
+    start_index = next(
+        (index for index, (label, _) in enumerate(commands) if label.startswith(f"Module {start_at_module} ")),
+        None,
+    )
+    if start_index is None:
+        raise ValueError(f"Module {start_at_module} is not part of the uploaded pipeline.")
     runner = command_runner or _run_script
     logs: list[str] = []
-    for label, command in commands:
+    for label, command in commands[start_index:]:
         if on_step:
             on_step(label, "running")
         try:
@@ -398,16 +461,17 @@ def _render_dashboard() -> None:
 def _render_pipeline_page() -> None:
     st.title("Run pipeline")
     settings = get_settings()
-    provider = st.selectbox("LLM provider", [settings.llm.provider, "mock", "openai", "openai_compatible", "gemini"], index=0)
+    provider = settings.llm.provider
     st.subheader("Add screenplay input and run the pipeline")
     st.caption("Upload TXT, PDF, or DOCX scripts. Files are stored under data/uploads/; each run writes isolated artifacts under outputs/runs/.")
+    st.caption("Execution order: " + " → ".join(str(module) for module in PIPELINE_MODULE_ORDER))
     uploaded_files = st.file_uploader(
         "Screenplay files",
         type=["txt", "pdf", "docx"],
         accept_multiple_files=True,
         key="pipeline_screenplay_uploads",
     )
-    if st.button("Save input and run all modules", type="primary", disabled=not uploaded_files, key="run_uploaded_pipeline"):
+    if st.button("Start processing", type="primary", disabled=not uploaded_files, key="run_uploaded_pipeline"):
         try:
             run_id, input_directory = _store_uploaded_files(uploaded_files)
         except (OSError, ValueError) as exc:
@@ -436,7 +500,11 @@ def _render_pipeline_page() -> None:
             with st.expander("Pipeline logs", expanded=exit_code != 0):
                 st.code(pipeline_output or "No console output returned.")
             if exit_code == 0:
-                st.success("Modules 1–6 and 8 completed for the uploaded input.")
+                st.success(
+                    "Modules "
+                    + " → ".join(str(module) for module in PIPELINE_MODULE_ORDER)
+                    + " completed for the uploaded input."
+                )
                 st.write(f"Run outputs: {run_output.relative_to(ROOT)}")
                 metrics = _read_json(run_output / "evaluation" / "evaluation_metrics.json", {})
                 if metrics:
@@ -457,7 +525,7 @@ def _render_pipeline_page() -> None:
         else:
             st.error(f"Pipeline exited with code {code}.")
 
-    st.caption("Provider and model choices are read from the current config; secret values are never displayed in the interface.")
+    st.caption("Provider and model are read from the current configuration.")
 
 
 def _render_ranked_promos() -> None:
@@ -630,26 +698,353 @@ def _render_export_page() -> None:
                 )
 
 
+def _run_files(run_root: Path) -> dict[str, Path]:
+    return {
+        "ranked_json": run_root / "promo_ranking_and_selection" / "ranked_promos.json",
+        "ranked_csv": run_root / "promo_ranking_and_selection" / "ranked_promos.csv",
+        "quality_json": run_root / "quality_evaluation_and_validation" / "quality_report.json",
+        "quality_csv": run_root / "quality_evaluation_and_validation" / "quality_report.csv",
+        "failures": run_root / "quality_evaluation_and_validation" / "failure_analysis.json",
+        "human_metrics": run_root / "evaluation" / "evaluation_metrics.json",
+        "human_report": run_root / "evaluation" / "evaluation_report.csv",
+        "human_errors": run_root / "evaluation" / "error_analysis.json",
+        "human_summary": run_root / "evaluation" / "evaluation_summary.md",
+        "reviews": run_root / "evaluation" / "human_reviews.json",
+    }
+
+
+def _display_value(value: Any, suffix: str = "") -> str:
+    return "Not available" if value is None or value == "" else f"{value}{suffix}"
+
+
+def _render_upload_screen() -> None:
+    st.title("PROMO AI")
+    st.caption("Intelligent promo discovery from your screenplay files.")
+    st.subheader("Upload screenplays")
+    st.write("Add one or more TXT, PDF, or DOCX files. Remove any file from the list before processing.")
+    st.caption("Pipeline order: " + " → ".join(str(module) for module in PIPELINE_MODULE_ORDER))
+
+    uploaded_files = st.file_uploader(
+        "Screenplay files",
+        type=["pdf", "txt", "docx"],
+        accept_multiple_files=True,
+        key="pipeline_screenplay_uploads",
+        help="Accepted formats: PDF, TXT, DOCX.",
+    )
+    if uploaded_files:
+        st.markdown("#### Selected files")
+        for uploaded in uploaded_files:
+            size = len(uploaded.getvalue())
+            try:
+                _validate_upload(uploaded)
+                status = "Ready"
+            except ValueError as exc:
+                status = f"Error: {exc}"
+            st.write(f"**{uploaded.name}** · {size:,} bytes · {status}")
+
+    if st.button("Start processing", type="primary", disabled=not uploaded_files, key="run_uploaded_pipeline"):
+        try:
+            run_id, input_directory = _store_uploaded_files(uploaded_files)
+        except (OSError, ValueError) as exc:
+            st.error(f"Upload validation failed: {exc}", title="Unable to start processing")
+            return
+
+        st.session_state["promo_ai_run_id"] = run_id
+        st.session_state["promo_ai_run_root"] = str(RUNS_ROOT / run_id)
+        st.session_state["promo_ai_input_directory"] = str(input_directory)
+        with st.status("Processing screenplays", expanded=True) as progress:
+            def update_step(label: str, state: str) -> None:
+                if state == "running":
+                    progress.update(label=label, state="running")
+                elif state == "complete":
+                    progress.update(label=f"{label} complete", state="running")
+                else:
+                    st.session_state["promo_ai_failed_module"] = int(label.split()[1])
+                    progress.update(label=f"{label} failed", state="error")
+
+            code, log, run_output = _execute_uploaded_pipeline(
+                input_directory, run_id, get_settings().llm.provider, on_step=update_step
+            )
+            progress.update(
+                label="Processing complete" if code == 0 else "Processing stopped at the failed module",
+                state="complete" if code == 0 else "error",
+            )
+
+        st.session_state["promo_ai_pipeline_error"] = "" if code == 0 else log
+        if code == 0:
+            st.session_state.pop("promo_ai_failed_module", None)
+        st.session_state["promo_ai_run_root"] = str(run_output)
+        st.session_state["promo_ai_navigate_results"] = True
+        if code == 0:
+            st.success("Processing completed in order: " + " → ".join(map(str, PIPELINE_MODULE_ORDER)))
+        else:
+            st.error("Processing stopped after a module failed. Available outputs are shown in Final results.")
+            with st.expander("Processing log", expanded=True):
+                st.code(log or "No console output returned.")
+        st.rerun()
+
+
+def _render_promo_recommendations(ranked: list[dict[str, Any]], quality_by_id: dict[str, dict[str, Any]]) -> None:
+    selected = [row for row in ranked if row.get("selection_status") == "selected"]
+    selected.sort(key=lambda row: float(row.get("raw_score") or 0), reverse=True)
+    st.subheader("Final promo recommendations")
+    if not selected:
+        st.info("No selected promo recommendations are available in this run.")
+        return
+
+    for index, promo in enumerate(selected, start=1):
+        promo_id = str(promo.get("promo_id", "Unknown promo"))
+        quality = quality_by_id.get(promo_id, {})
+        score = promo.get("raw_score", "N/A")
+        with st.expander(f"#{index} · {promo_id} · score {score}", expanded=index == 1):
+            columns = st.columns(4)
+            segments = promo.get("segments") or []
+            episode_ids = promo.get("episode_ids") or list(dict.fromkeys(
+                segment.get("episode_id") for segment in segments if segment.get("episode_id") is not None
+            ))
+            columns[0].metric("Episode", ", ".join(map(str, episode_ids)) or "N/A")
+            columns[1].metric("Type", "Multi-segment" if promo.get("promo_type") == "multi_segment" or len(segments) > 1 else "Continuous")
+            columns[2].metric("Duration", _display_value(promo.get("total_duration"), " sec"))
+            columns[3].metric("Quality", quality.get("quality_decision", "Pending"))
+            st.write(f"**Posting priority:** {_display_value(promo.get('posting_priority') or promo.get('rank'))}")
+            st.write(f"**Category:** {_display_value(promo.get('promotional_category') or promo.get('quality_category'))}")
+            if segments:
+                st.markdown("**Segments**")
+                for segment_index, segment in enumerate(segments, start=1):
+                    st.write(
+                        f"Segment {segment.get('segment_order') or segment_index}: Episode {segment.get('episode_id', 'N/A')} · "
+                        f"{segment.get('start_time', 'N/A')} – {segment.get('end_time', 'N/A')}"
+                    )
+            else:
+                st.write("Segment timestamps: Not available in the ranking output.")
+            st.write(f"**Hook:** {(promo.get('hook') or {}).get('description', 'Not available')}")
+            st.write(f"**Cliffhanger:** {(promo.get('cliffhanger') or {}).get('description', 'Not available')}")
+            st.write(f"**Why it works:** {promo.get('overall_summary') or promo.get('combined_summary') or 'No explanation was provided.'}")
+            if promo.get("ranking_explanation"):
+                st.caption(f"Ranking explanation: {promo['ranking_explanation']}")
+
+
+def _render_quality_results(quality: dict[str, Any], failures: dict[str, Any]) -> None:
+    st.subheader("Module 5 · Automated quality evaluation")
+    if not quality:
+        st.warning("Module 5 quality evaluation is unavailable for this run.")
+        return
+    counts = quality.get("quality_decision_counts") or {}
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Evaluated", quality.get("candidates_evaluated", 0))
+    summary_columns[1].metric("PASS", counts.get("PASS", 0))
+    summary_columns[2].metric("PASS_WITH_WARNINGS", counts.get("PASS_WITH_WARNINGS", 0))
+    summary_columns[3].metric("FAIL", counts.get("FAIL", 0))
+    quality_rows = quality.get("candidate_results") or []
+    technical_by_id = {
+        str(item.get("promo_id")): item
+        for item in quality.get("technical_validation_results", [])
+        if isinstance(item, dict)
+    }
+    with st.expander("Detailed checks, issues, and explanations"):
+        if not quality_rows:
+            st.info("Module 5 did not produce per-promo quality records.")
+        for row in quality_rows:
+            promo_id = str(row.get("promo_id", "Unknown promo"))
+            technical = technical_by_id.get(promo_id, {})
+            with st.container(border=True):
+                st.markdown(f"**{promo_id} — {row.get('quality_decision', 'Unknown status')}**")
+                technical_status = technical.get("status", row.get("technical_status", "Unavailable"))
+                st.write(
+                    "Technical checks (timestamps, 20–60 second duration, episode/scene references): "
+                    f"{technical_status}"
+                )
+                narrative = row.get("narrative_evaluation") or {}
+                criterion_labels = {
+                    "opening_hook": "Hook quality", "ending_cliffhanger": "Cliffhanger quality",
+                    "standalone_understandability": "Standalone understandability",
+                    "narrative_coherence": "Narrative coherence", "emotional_engagement": "Emotional impact",
+                }
+                if narrative:
+                    for key, label in criterion_labels.items():
+                        check = narrative.get(key) or {}
+                        score = _display_value(check.get("score"))
+                        st.write(f"{label}: {score}/10 — {check.get('explanation', '')}")
+                else:
+                    st.write(row.get("narrative_evaluation_message") or "Narrative checks were not available in the Module 5 output.")
+                findings = [
+                    *technical.get("errors", row.get("technical_errors", [])),
+                    *technical.get("warnings", row.get("technical_warnings", [])),
+                    *row.get("failure_labels", []),
+                ]
+                if findings:
+                    st.markdown("**Issues and warnings**")
+                    for finding in findings:
+                        if isinstance(finding, dict):
+                            st.write(
+                                f"{str(finding.get('severity', 'info')).upper()} · "
+                                f"{finding.get('category', 'Finding')}: "
+                                f"{finding.get('explanation') or finding.get('message', '')}"
+                            )
+                st.caption(row.get("explanation", ""))
+    if failures:
+        with st.expander("Module 5 failure analysis"):
+            st.json(failures)
+
+
+def _render_human_results(metrics: dict[str, Any], error_analysis: dict[str, Any], reviews: list[dict[str, Any]]) -> None:
+    st.subheader("Module 8 · Human evaluation")
+    if not metrics:
+        st.warning("Module 8 human evaluation report is unavailable for this run.")
+        return
+    reviewed = int(metrics.get("reviewed_promo_count") or 0)
+    if reviewed == 0 and not reviews:
+        st.info("Human evaluation is not available yet. Review data will appear here once reviewers submit their assessments.")
+        if metrics.get("human_review_dataset_size"):
+            st.caption("A review set was prepared, but no reviewer submissions were recorded.")
+        return
+    st.write(f"Reviewed promos: **{reviewed}** · Review submissions: **{metrics.get('review_submission_count', len(reviews))}** · Reviewers: **{metrics.get('reviewer_count', 'N/A')}**")
+    distribution = metrics.get("approval_counts") or {}
+    cols = st.columns(3)
+    cols[0].metric("Strong", distribution.get("strong", 0))
+    cols[1].metric("Average", distribution.get("average", 0))
+    cols[2].metric("Poor", distribution.get("poor", 0))
+    averages = metrics.get("average_human_ratings") or {}
+    st.markdown("**Average reviewer ratings**")
+    rating_names = {
+        "hook_rating": "Hook", "cliffhanger_rating": "Cliffhanger",
+        "standalone_rating": "Standalone understandability", "coherence_rating": "Coherence",
+        "emotional_impact_rating": "Emotional impact", "promotional_potential_rating": "Promotional potential",
+    }
+    rating_cols = st.columns(3)
+    for index, (key, label) in enumerate(rating_names.items()):
+        rating_cols[index % 3].metric(label, _display_value(averages.get(key)))
+    agreement = metrics.get("human_ai_agreement") or {}
+    precision = metrics.get("precision_at_k") or {}
+    precision_text = ", ".join(
+        f"P@{key} {_display_value((value or {}).get('value'))}" for key, value in precision.items()
+    ) or "Not available"
+    inter = metrics.get("inter_reviewer_agreement") or {}
+    st.markdown("**Ranking and reviewer agreement**")
+    st.write(f"Precision@K: {precision_text}")
+    st.write(f"Spearman rank agreement: {_display_value(agreement.get('spearman_rank_correlation'))}")
+    st.write(f"Kendall rank agreement: {_display_value(agreement.get('kendall_tau_b'))}")
+    st.write(f"Inter-reviewer agreement ({inter.get('method') or 'method unavailable'}): {_display_value(inter.get('value'))}")
+    disagreements = (error_analysis or {}).get("human_ai_disagreements") or []
+    st.write(f"AI–human ranking disagreements: {len(disagreements)}")
+    if disagreements:
+        with st.expander("Disagreements and reviewer feedback"):
+            st.json(disagreements)
+    if reviews:
+        with st.expander("Reviewer comments"):
+            for review in reviews:
+                comment = review.get("comments") or "No comment provided."
+                st.write(f"**{review.get('promo_id')} · {review.get('reviewer_id')}**: {comment}")
+
+
+def _render_exports(files: dict[str, Path]) -> None:
+    st.subheader("Download reports")
+    downloads = [
+        ("Final ranked recommendations (JSON)", "ranked_json", "application/json"),
+        ("Final ranked recommendations (CSV)", "ranked_csv", "text/csv"),
+        ("Module 5 quality report", "quality_json", "application/json"),
+        ("Module 5 quality report (CSV)", "quality_csv", "text/csv"),
+        ("Module 5 failure analysis", "failures", "application/json"),
+        ("Module 8 human evaluation metrics", "human_metrics", "application/json"),
+        ("Module 8 human evaluation report", "human_report", "text/csv"),
+        ("Module 8 error analysis", "human_errors", "application/json"),
+        ("Module 8 evaluation summary", "human_summary", "text/markdown"),
+    ]
+    available = [(label, files[key], mime) for label, key, mime in downloads if files[key].is_file()]
+    if not available:
+        st.info("No downloadable reports are available for this run yet.")
+        return
+    for label, path, mime in available:
+        st.download_button(label, path.read_bytes(), file_name=path.name, mime=mime, key=f"download_{path.name}")
+
+
+def _render_results_screen() -> None:
+    run_root_value = st.session_state.get("promo_ai_run_root")
+    if not run_root_value:
+        st.info("Upload screenplays and start processing to see final recommendations here.")
+        return
+    run_root = Path(run_root_value)
+    st.title("Final results")
+    st.caption(f"Run: {st.session_state.get('promo_ai_run_id', run_root.name)}")
+    pipeline_error = st.session_state.get("promo_ai_pipeline_error")
+    if pipeline_error:
+        st.error("The pipeline did not complete. Results below include outputs available before the failed module.")
+        with st.expander("Pipeline error details"):
+            st.code(pipeline_error)
+        failed_module = int(st.session_state.get("promo_ai_failed_module", 1))
+        input_directory_value = st.session_state.get("promo_ai_input_directory")
+        input_directory = Path(input_directory_value) if input_directory_value else None
+        if input_directory is not None and input_directory.is_dir():
+            st.caption(
+                f"Retry from Module {failed_module}. Completed earlier stages will be left alone; "
+                "Module 3 resumes from its saved candidate checkpoint."
+            )
+            if st.button("Retry failed stage", type="primary", key="retry_failed_stage"):
+                with st.status(f"Resuming at Module {failed_module}", expanded=True) as progress:
+                    def update_step(label: str, state: str) -> None:
+                        if state == "running":
+                            progress.update(label=label, state="running")
+                        elif state == "complete":
+                            progress.update(label=f"{label} complete", state="running")
+                        else:
+                            st.session_state["promo_ai_failed_module"] = int(label.split()[1])
+                            progress.update(label=f"{label} failed", state="error")
+
+                    code, log, run_output = _execute_uploaded_pipeline(
+                        input_directory,
+                        str(st.session_state.get("promo_ai_run_id", run_root.name)),
+                        get_settings().llm.provider,
+                        on_step=update_step,
+                        start_at_module=failed_module,
+                    )
+                    progress.update(
+                        label="Processing complete" if code == 0 else "Processing stopped at the failed module",
+                        state="complete" if code == 0 else "error",
+                    )
+                st.session_state["promo_ai_pipeline_error"] = "" if code == 0 else log
+                st.session_state["promo_ai_run_root"] = str(run_output)
+                if code == 0:
+                    st.session_state.pop("promo_ai_failed_module", None)
+                st.rerun()
+    files = _run_files(run_root)
+    ranked = _load_list(files["ranked_json"])
+    quality = _read_json(files["quality_json"], {})
+    failures = _read_json(files["failures"], {})
+    metrics = _read_json(files["human_metrics"], {})
+    error_analysis = _read_json(files["human_errors"], {})
+    reviews = load_human_reviews(files["reviews"])
+    quality_by_id = {
+        str(item.get("promo_id")): item
+        for item in quality.get("candidate_results", [])
+        if isinstance(item, dict)
+    } if isinstance(quality, dict) else {}
+    _render_promo_recommendations(ranked, quality_by_id)
+    _render_quality_results(quality if isinstance(quality, dict) else {}, failures if isinstance(failures, dict) else {})
+    _render_human_results(metrics if isinstance(metrics, dict) else {}, error_analysis if isinstance(error_analysis, dict) else {}, reviews)
+    _render_exports(files)
+
+
 def _main() -> None:
     if st is None:
         raise RuntimeError("Streamlit is not installed. Run: python -m pip install -r requirements.txt")
 
-    st.set_page_config(page_title="Module 7: Kuku Promo Pipeline", page_icon="🎬", layout="wide")
-    pages = ["Dashboard", "Run Pipeline", "Ranked Promos", "Promo Details", "Quality Analysis", "Export Results"]
-    selected = st.sidebar.radio("Navigation", pages)
-
-    if selected == "Dashboard":
-        _render_dashboard()
-    elif selected == "Run Pipeline":
-        _render_pipeline_page()
-    elif selected == "Ranked Promos":
-        _render_ranked_promos()
-    elif selected == "Promo Details":
-        _render_promo_detail()
-    elif selected == "Quality Analysis":
-        _render_quality_analysis()
+    st.set_page_config(page_title="PROMO AI - Intelligent Promo Discovery", page_icon=":material/movie:", layout="wide")
+    if st.session_state.pop("promo_ai_navigate_results", False):
+        st.session_state["promo_ai_view"] = "Final results"
+    st.sidebar.title("PROMO AI")
+    st.sidebar.caption("Intelligent promo discovery")
+    current_run = st.session_state.get("promo_ai_run_id")
+    st.sidebar.caption(f"Status: {'Results ready' if current_run else 'Ready for upload'}")
+    view = st.sidebar.radio(
+        "Section",
+        ["Upload screen", "Final results"],
+        key="promo_ai_view",
+        label_visibility="collapsed",
+    )
+    if view == "Upload screen":
+        _render_upload_screen()
     else:
-        _render_export_page()
+        _render_results_screen()
 
 
 if __name__ == "__main__":

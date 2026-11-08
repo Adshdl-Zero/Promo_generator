@@ -27,8 +27,22 @@ def retry_delay_seconds(exc: Exception, attempt: int, base_seconds: float, maxim
             except (TypeError, ValueError, OverflowError):
                 pass
     # Some compatible providers put their reset estimate in the error body
-    # instead of a Retry-After response header (for example, "try again in 18s").
-    match = re.search(r"(?:try again in|retry after)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?\b", str(exc), re.IGNORECASE)
+    # instead of a Retry-After response header (for example, "try again in 18s"
+    # or "Please try again in 2m38.112s").
+    message = str(exc)
+    compound = re.search(
+        r"(?:try again in|retry after)\s+(?:(\d+(?:\.\d+)?)m)?(\d+(?:\.\d+)?)s\b",
+        message,
+        re.IGNORECASE,
+    )
+    if compound:
+        minutes = float(compound.group(1) or 0)
+        seconds = float(compound.group(2) or 0)
+        return min(maximum_seconds, minutes * 60 + seconds)
+    minutes_only = re.search(r"(?:try again in|retry after)\s+(\d+)m\b", message, re.IGNORECASE)
+    if minutes_only:
+        return min(maximum_seconds, float(minutes_only.group(1)) * 60)
+    match = re.search(r"(?:try again in|retry after)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?\b", message, re.IGNORECASE)
     if match:
         return min(maximum_seconds, max(0.0, float(match.group(1))))
     return min(maximum_seconds, max(0.0, base_seconds) * (2**max(0, attempt)))

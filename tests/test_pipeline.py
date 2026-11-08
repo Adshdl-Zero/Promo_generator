@@ -202,6 +202,42 @@ def test_scene_analyzer_paces_provider_requests(monkeypatch):
 
 def test_retry_delay_uses_provider_rate_limit_estimate():
     assert retry_delay_seconds(RuntimeError("try again in 17.9s"), 0, 1.0) == 17.9
+    assert retry_delay_seconds(
+        RuntimeError("Please try again in 2m38.112s"), 0, 1.0, maximum_seconds=300.0
+    ) == 158.112
+
+
+def test_candidate_evaluator_retries_rate_limited_request(monkeypatch):
+    class RateLimitedThenSuccessProvider:
+        provider_name = "test"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate_json(self, prompt, response_schema=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("429 rate_limit_exceeded; try again in 0.25s")
+            return {"overall_summary": "Recovered after retry."}
+
+        @staticmethod
+        def parse_json_response(response):
+            return response
+
+    sleeps = []
+    monkeypatch.setattr("src.generation.candidate_evaluator.time.sleep", sleeps.append)
+    provider = RateLimitedThenSuccessProvider()
+    evaluator = CandidateEvaluator(provider, max_retries=3, retry_backoff_seconds=1.0)
+    candidate = {
+        "segments": [{"episode_id": 1, "scene_ids": [1], "start_time": "00:00:10", "end_time": "00:00:30"}],
+        "total_duration": 20,
+    }
+
+    result = evaluator.evaluate({"episode_id": 1, "scenes": []}, candidate, [])
+
+    assert provider.calls == 2
+    assert sleeps == [0.25]
+    assert result["overall_summary"] == "Recovered after retry."
 
 
 def test_promo_prompt_includes_only_events_inside_clip_window():

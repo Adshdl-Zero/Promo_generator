@@ -27,6 +27,7 @@ evaluation:
   minimum_cliffhanger_score: 6
   minimum_context_score: 5
   max_candidates: 25
+  request_interval_seconds: 16
 
 ranking:
   weights:

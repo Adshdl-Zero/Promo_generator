@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from src.analysis.prompts import PROMO_EVALUATION_TEMPLATE
 from src.llm.factory import create_provider
 from src.utils.timestamp import parse_timestamp
+from src.utils.retry import RequestPacer, is_rate_limit_error, retry_delay_seconds
 
 MAX_PROMO_WINDOW_CHARS = 2400
 MAX_SCENE_SUMMARY_CHARS = 180
+logger = logging.getLogger(__name__)
 
 
 def _truncate_preserving_ending(text: str, max_chars: int) -> str:
@@ -24,8 +28,18 @@ def _truncate_preserving_ending(text: str, max_chars: int) -> str:
 class CandidateEvaluator:
     """Assess a candidate sequence as a complete promo and return structured evaluation data."""
 
-    def __init__(self, provider: Any | None = None) -> None:
+    def __init__(
+        self,
+        provider: Any | None = None,
+        *,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 1.0,
+        request_interval_seconds: float = 0.0,
+    ) -> None:
         self.provider = provider or create_provider()
+        self.max_retries = max(1, max_retries)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+        self.pacer = RequestPacer(request_interval_seconds)
 
     def build_prompt(self, episode: dict[str, Any], candidate: dict[str, Any], scene_analyses: list[dict[str, Any]]) -> str:
         start_time = candidate["segments"][0]["start_time"]
@@ -75,7 +89,28 @@ class CandidateEvaluator:
 
     def evaluate(self, episode: dict[str, Any], candidate: dict[str, Any], scene_analyses: list[dict[str, Any]]) -> dict[str, Any]:
         prompt = self.build_prompt(episode, candidate, scene_analyses)
-        response = self.provider.generate_json(prompt, {})
+        for attempt in range(self.max_retries):
+            self.pacer.wait()
+            try:
+                response = self.provider.generate_json(prompt, {})
+                break
+            except Exception as exc:
+                if not is_rate_limit_error(exc) or attempt + 1 >= self.max_retries:
+                    raise
+                delay = retry_delay_seconds(
+                    exc,
+                    attempt,
+                    self.retry_backoff_seconds,
+                    maximum_seconds=300.0,
+                )
+                logger.warning(
+                    "Module 3 evaluation rate limited for promo %s; retrying in %.1fs (%d/%d)",
+                    candidate.get("promo_id", "unknown"),
+                    delay,
+                    attempt + 1,
+                    self.max_retries - 1,
+                )
+                time.sleep(delay)
         payload = self.provider.parse_json_response(response)
         hook_value = payload.get("hook")
         hook = dict(hook_value) if isinstance(hook_value, dict) else {

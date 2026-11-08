@@ -74,7 +74,12 @@ def main() -> None:
         max_duration=settings.candidate_generation.max_duration,
         preferred_methods=settings.candidate_generation.methods,
     )
-    evaluator = CandidateEvaluator(provider)
+    evaluator = CandidateEvaluator(
+        provider,
+        max_retries=settings.llm.max_retries,
+        retry_backoff_seconds=settings.llm.retry_backoff_seconds,
+        request_interval_seconds=settings.evaluation.request_interval_seconds,
+    )
 
     pending: list[tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]] = []
     for episode in episodes:
